@@ -1,0 +1,51 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type checker / linter caches
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Logs
+*.log
+
+# IDE / editor files
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
