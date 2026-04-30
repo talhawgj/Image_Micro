@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     Loads from environment variables or a local .env file.
     """
     AWS_REGION: str = "us-east-2"
-    AWS_BUCKET_IMAGES: str = "radcorp-images1"
+    AWS_BUCKET_IMAGES: str = "dev=redcorp-images"
     SQS_REGEN_QUEUE_URL: Optional[str] = None
 
     # --- Amazon EFS Mount Paths ---
