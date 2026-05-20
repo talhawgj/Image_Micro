@@ -3,6 +3,7 @@ import os
 import json
 import asyncio
 import base64
+import shutil
 import tempfile
 import math
 from collections.abc import Callable
@@ -36,8 +37,6 @@ class ImageService:
         self.s3_bucket = config.AWS_BUCKET_IMAGES
         self.s3_region = config.AWS_REGION
         self.s3_base_url = f"https://{self.s3_bucket}.s3.{self.s3_region}.amazonaws.com"
-        
-        # Amazon EFS mount paths for Lambda
         self.dem_path = config.ELEVATION_FILE
         self.tree_path = config.TREE_COVERAGE_PATH
 
@@ -290,11 +289,12 @@ class ImageService:
     async def _render_and_screenshot(self, m: folium.Map) -> BytesIO:
         html_content = m.get_root().render()
         fd, temp_path = tempfile.mkstemp(suffix=".html", dir="/tmp")
+        chrome_temp_dirs = []
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 f.write(html_content)
             
-            driver = get_chrome_driver()
+            driver,chrome_temp_dirs = get_chrome_driver()
             try:
                 await asyncio.to_thread(driver.set_window_size, 1600, 1200)
                 await asyncio.to_thread(driver.get, f"file://{temp_path}")
@@ -307,7 +307,17 @@ class ImageService:
                 return buf
             finally:
                 await asyncio.to_thread(driver.quit)
+                for d in chrome_temp_dirs:
+                    try:
+                        shutil.rmtree(d,ignore_errors=True)
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to clean up Chrome temp directory {d}: {cleanup_error}")
         finally:
+            for d in chrome_temp_dirs:
+                try:
+                    shutil.rmtree(d,ignore_errors=True)
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to clean up Chrome temp directory {d}: {cleanup_error}")
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
@@ -330,21 +340,45 @@ class ImageService:
 
     async def _gen_road(self, gid: int, geom_input: str, features: list) -> Union[BytesIO, Dict]:
         if not features:
-            return {"message": "No road frontage detected within 100m.", "status": "no_data"}
-        
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
+            return {"message": "No road frontage detected within 1.5 km.", "status": "no_data"}
+    
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.4)
         m = self._create_base_map(bounds)
+        ROAD_STROKE = '#9E9E9E'
+        ROAD_CASING = '#424242'
         
-        road_style = {'color': '#FFFFFF', 'weight': 3, 'opacity': 1.0, 'lineCap': 'round', 'lineJoin': 'round'}
         for feat in features:
             feat_geom = self._feature_geometry(feat)
-            folium.GeoJson(feat_geom, style_function=lambda x: road_style).add_to(m)
+            folium.GeoJson(
+                feat_geom,
+                style_function=lambda x: {
+                    'color': ROAD_CASING,
+                    'weight': 6.5,
+                    'opacity': 0.9,
+                    'lineCap': 'round',
+                    'lineJoin': 'round'
+                }
+            ).add_to(m)
+            
+            # Primary road stroke
+            folium.GeoJson(
+                feat_geom,
+                style_function=lambda x: {
+                    'color': ROAD_STROKE,
+                    'weight': 3.5,
+                    'opacity': 0.95,
+                    'lineCap': 'round',
+                    'lineJoin': 'round'
+                }
+            ).add_to(m)
         
         self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
+        
         self._add_legend(m, [
             f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary",
-            "<span style='color:#FFFFFF; background-color:#333; padding: 0 2px;'>▬</span> Texas Roads"
+            f"<span style='color:{ROAD_STROKE}; background-color:{ROAD_CASING}; padding: 0 3px; font-weight: bold;'>▬</span> Road Frontage"
         ])
+        
         return await self._render_and_screenshot(m)
 
     async def get_flood_image(self, gid: int, geom_input: str, features: list, regenerate: bool = False):
@@ -457,12 +491,11 @@ class ImageService:
 
         shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
         m = self._create_base_map(bounds)
-
         for feat in features:
             c_geom = self._feature_geometry(feat)
             props = self._feature_properties(feat)
             elevation = props.get("elevation")
-            folium.GeoJson(c_geom, style_function=lambda x: {'color': '#FFFF00', 'weight': 1, 'opacity': 0.8}).add_to(m)
+            folium.GeoJson(c_geom, style_function=lambda x: {'color': '#FFFF00', 'weight': 2, 'opacity': 0.8}).add_to(m)
             
             if elevation is not None:
                 mid_point = c_geom.interpolate(0.5, normalized=True)
@@ -487,38 +520,34 @@ class ImageService:
             
         shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
         m = self._create_base_map(bounds)
-        
-        wetland_styles = {
-            'Estuarine and Marine Deepwater': {'f': '#1E88E5', 's': '#0D47A1', 'op': 0.35},
-            'Freshwater Pond': {'f': '#81D4FA', 's': '#0288D1', 'op': 0.40},
-            'Lake': {'f': '#64B5F6', 's': '#1565C0', 'op': 0.40},
-            'Riverine': {'f': '#4FC3F7', 's': '#0277BD', 'op': 0.35},
-        }
+        # Force all water-related features to render in a consistent blue palette
+        WATER_FILL = '#1E88E5'
+        WATER_STROKE = '#0D47A1'
+        WATER_LINE = '#1976D2'
+        WATER_OPACITY = 0.5
 
         for feat in features:
             feat_geom = self._feature_geometry(feat)
             props = self._feature_properties(feat)
-            f_type = props.get("type", "wetland")
-            
-            if f_type == "stream":
-                folium.GeoJson(feat_geom, style_function=lambda x: {'color': '#4FC3F7', 'weight': 2.5, 'lineCap': 'round', 'lineJoin': 'round'}).add_to(m)
+            f_type = (props.get("type") or "").lower()
+
+            # Render linear features (streams, rivers) as blue lines
+            if f_type in {"stream", "river", "creek"}:
+                folium.GeoJson(feat_geom, style_function=lambda x: {'color': WATER_LINE, 'weight': 2.5, 'lineCap': 'round', 'lineJoin': 'round', 'opacity': 1.0}).add_to(m)
                 name = props.get("name")
                 if name:
                     mid = feat_geom.interpolate(0.5, normalized=True)
-                    folium.map.Marker([mid.y, mid.x], icon=folium.DivIcon(html=f"""<div style="font-family: Arial, sans-serif; font-size: 11pt; color: white; font-style: italic; font-weight: bold; white-space: nowrap; text-shadow: -2px -2px 0 #01579B, 2px -2px 0 #01579B, -2px 2px 0 #01579B, 2px 2px 0 #01579B;">{name}</div>""")).add_to(m)
-            elif f_type == "wetland":
-                w_type = props.get("wetland_type", "Freshwater Pond")
-                style = wetland_styles.get(w_type, {'f': '#B0BEC5', 's': '#546E7A', 'op': 0.30})
-                folium.GeoJson(feat_geom, style_function=lambda x, s=style: {'fillColor': s['f'], 'color': s['s'], 'fillOpacity': s['op'], 'weight': 1.5}).add_to(m)
-            elif f_type == "sea":
-                folium.GeoJson(feat_geom, style_function=lambda x: {'fillColor': '#1E88E5', 'color': '#0D47A1', 'fillOpacity': 0.4, 'weight': 1}).add_to(m)
+                    folium.map.Marker([mid.y, mid.x], icon=folium.DivIcon(html=f"""<div style="font-family: Arial, sans-serif; font-size: 11pt; color: white; font-style: italic; font-weight: bold; white-space: nowrap; text-shadow: -2px -2px 0 {WATER_STROKE}, 2px -2px 0 {WATER_STROKE}, -2px 2px 0 {WATER_STROKE}, 2px 2px 0 {WATER_STROKE};">{name}</div>""")).add_to(m)
+
+            # Render polygonal water features (ponds, lakes, wetlands, open sea) as blue fills
+            else:
+                folium.GeoJson(feat_geom, style_function=lambda x: {'fillColor': WATER_FILL, 'color': WATER_STROKE, 'fillOpacity': WATER_OPACITY, 'weight': 1.5}).add_to(m)
 
         self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
         self._add_legend(m, [
             f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary", 
-            "<span style='color:#4FC3F7;'>▬</span> Major Rivers",
-            "<span style='color:#80CBC4;'>■</span> Wetlands / Ponds",
-            "<span style='color:#1E88E5;'>■</span> Open Water"
+            f"<span style='color:{WATER_LINE};'>▬</span> Rivers/Streams",
+            f"<span style='color:{WATER_FILL};'>■</span> Ponds/Lakes/Wetlands/Open Water",
         ])
         return await self._render_and_screenshot(m)
 
@@ -584,7 +613,6 @@ class ImageService:
                 folium.GeoJson(feat_geom, style_function=lambda x: {'color': '#FF6D00', 'weight': 2, 'dashArray': '12, 6', 'opacity': 1.0}).add_to(m)
 
             else:
-                # Fallback so mixed/unknown schemas still render on the map.
                 has_any_line = True
                 folium.GeoJson(feat_geom, style_function=lambda x: {'color': '#F2F2F2', 'weight': 3, 'opacity': 0.9, 'lineCap': 'round'}).add_to(m)
 
@@ -612,20 +640,26 @@ class ImageService:
         shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
         m = self._create_base_map(bounds)
 
-        svg_well_html = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="35" height="35" style="filter: drop-shadow(2px 2px 3px rgba(0,0,0,0.5));"><rect x="25" y="55" width="50" height="35" rx="5" fill="black"/><rect x="28" y="20" width="8" height="35" fill="black"/><rect x="64" y="20" width="8" height="35" fill="black"/><rect x="30" y="25" width="40" height="4" fill="black"/><path d="M70 25 h8 v12 h-4" fill="none" stroke="black" stroke-width="4"/><rect x="48" y="29" width="2" height="10" fill="black"/><path d="M40 39 h18 l-3 15 h-12 z" fill="black"/></svg>"""
-
+        # Use a simple point marker (CircleMarker) instead of a large SVG pin
+        marker_color = "#cb2b27"
         for feat in features:
             point_geom = self._feature_geometry(feat)
-            folium.Marker(
+            folium.CircleMarker(
                 location=[point_geom.y, point_geom.x],
-                icon=folium.DivIcon(html=svg_well_html, icon_size=(35, 35), icon_anchor=(17, 35)),
-                tooltip="Water Well"
+                radius=6,
+                color=marker_color,
+                fill=True,
+                fill_color=marker_color,
+                fill_opacity=0.95,
+                weight=1,
+                tooltip="Water Well",
             ).add_to(m)
-        
+
         self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
+        # Legend: show a small colored circle for wells
         self._add_legend(m, [
-            f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary", 
-            f"{svg_well_html} Water Well"
+            f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary",
+            f"<svg width='12' height='12' xmlns='http://www.w3.org/2000/svg'><circle cx='6' cy='6' r='5' fill='{marker_color}' stroke='white' stroke-width='1'/></svg> Water Well"
         ])
         return await self._render_and_screenshot(m)
 
@@ -726,6 +760,9 @@ class ImageService:
 
         has_streams = False
         has_ponds = False
+        WATER_FILL = '#1E88E5'
+        WATER_STROKE = '#0D47A1'
+        WATER_LINE = '#1976D2'
         for feat in features:
             feat_geom = self._feature_geometry(feat)
             props = self._feature_properties(feat)
@@ -737,7 +774,7 @@ class ImageService:
                 folium.GeoJson(
                     feat_geom,
                     style_function=lambda x: {
-                        "color": "#4FC3F7",
+                        "color": WATER_LINE,
                         "weight": 2.5,
                         "lineCap": "round",
                         "lineJoin": "round",
@@ -757,8 +794,8 @@ class ImageService:
                 folium.GeoJson(
                     feat_geom,
                     style_function=lambda x: {
-                        "fillColor": "#AAAAAA",
-                        "color": "#000000",
+                        "fillColor": WATER_FILL,
+                        "color": WATER_STROKE,
                         "weight": 1,
                         "fillOpacity": 0.6,
                     },
@@ -770,9 +807,9 @@ class ImageService:
         self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
         legend_items = [f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary"]
         if has_streams:
-            legend_items.append("<span style='color:#4FC3F7; font-weight:bold;'>▬</span> Rivers/Creeks")
+            legend_items.append(f"<span style='color:{WATER_LINE}; font-weight:bold;'>▬</span> Rivers/Creeks")
         if has_ponds:
-            legend_items.append("<span style='display:inline-block; width:12px; height:12px; background:#AAAAAA; border:1px solid #000;'></span> Ponds")
+            legend_items.append(f"<span style='display:inline-block; width:12px; height:12px; background:{WATER_FILL}; border:1px solid {WATER_STROKE};'></span> Ponds/Lakes/Wetlands")
         self._add_legend(m, legend_items)
         return await self._render_and_screenshot(m)
 

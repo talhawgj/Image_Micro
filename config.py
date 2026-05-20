@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     Loads from environment variables or a local .env file.
     """
     AWS_REGION: str = "us-east-2"
-    AWS_BUCKET_IMAGES: str = "dev=redcorp-images"
+    AWS_BUCKET_IMAGES: str = "dev-redcorp-images"
     SQS_REGEN_QUEUE_URL: Optional[str] = None
 
     # --- Amazon EFS Mount Paths ---
@@ -25,7 +25,7 @@ class Settings(BaseSettings):
 config = Settings()
 
 
-#aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 525133621869.dkr.ecr.us-east-2.amazonaws.com
-# docker tag gis-image-service:latest 525133621869.dkr.ecr.us-east-2.amazonaws.com/gis-image-service:latest
+#aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 603195189624.dkr.ecr.us-east-2.amazonaws.com
+# docker tag gis-image-service:latest 603195189624.dkr.ecr.us-east-2.amazonaws.com/gis-image-service:latest
 
-# docker push 525133621869.dkr.ecr.us-east-2.amazonaws.com/gis-image-service:latest
+# docker push 603195189624.dkr.ecr.us-east-2.amazonaws.com/gis-image-service:latest

@@ -4,6 +4,7 @@ import logging
 import boto3
 from fastapi import APIRouter, HTTPException, File, Form, UploadFile
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from schemas import ImageRequestPayload
 from services import image_service
 from config import config
@@ -19,7 +20,7 @@ def _format_response(result):
     """Helper to consistently format the service responses."""
     if isinstance(result, str):
         return JSONResponse(content={"image_url": result})
-    return JSONResponse(content=result)
+    return JSONResponse(content=jsonable_encoder(result))
 
 @router.post("/parcel", summary="Get Aerial Parcel Image")
 async def get_parcel_image(payload: ImageRequestPayload):
@@ -174,6 +175,7 @@ async def queue_async_regeneration(image_type: str, payload: ImageRequestPayload
         
     try:
         message_body = {"task_type": image_type, "payload": payload.model_dump()}
+        message_body = jsonable_encoder(message_body)
         sqs_client.send_message(QueueUrl=SQS_QUEUE_URL, MessageBody=json.dumps(message_body))
         
         return JSONResponse(status_code=202, content={

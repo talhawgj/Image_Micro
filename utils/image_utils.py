@@ -4,6 +4,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 import tempfile
 import logging
+import shutil
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,12 @@ def get_chrome_driver():
     try:
         service = Service("/usr/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=options)
-        return driver
+        return driver,[user_data_dir, data_path, disk_cache_dir]
     except Exception as e:
+        for d in [user_data_dir, data_path, disk_cache_dir]:
+            try:
+                shutil.rmtree(d,ignore_errors=True)
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to clean up temp directory {d}: {cleanup_error}")
         logger.error(f"Failed to start ChromeDriver: {e}")
         raise RuntimeError(f"ChromeDriver initialization failed: {e}")
