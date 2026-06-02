@@ -197,10 +197,14 @@ class ImageService:
 
         minx, miny, maxx, maxy = shapely_geom.bounds
         center_lat = (miny + maxy) / 2
-        delta_lon, delta_lat = self._km_to_degree_deltas(buffer_km, latitude=center_lat)
+        parcel_span_lon = maxx - minx
+        parcel_span_lat = maxy - miny
+        parcel_span_km = max(parcel_span_lon, parcel_span_lat) * 111.0  # rough degrees→km
+        adaptive_buffer_km = max(buffer_km, parcel_span_km * 0.20)
+
+        delta_lon, delta_lat = self._km_to_degree_deltas(adaptive_buffer_km, latitude=center_lat)
         
         return shapely_geom, [minx - delta_lon, miny - delta_lat, maxx + delta_lon, maxy + delta_lat]
-    
     def _create_base_map(self, bounds: List[float], padding: int = 0) -> folium.Map:
         minx, miny, maxx, maxy = bounds
         center_lat = (miny + maxy) / 2
@@ -329,9 +333,9 @@ class ImageService:
         return await self._handle_cache_or_generate(gid, "aerial", self._gen_parcel, geom_input, regenerate)
 
     async def _gen_parcel(self, gid: int, geom_input: str) -> BytesIO:
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
-        m = self._create_base_map(bounds)
-        self._apply_parcel_style(m, shapely_geom, darken_exterior=True)
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.05)
+        m = self._create_base_map(bounds, padding=40)
+        self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
         self._add_legend(m, [f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary"])
         return await self._render_and_screenshot(m)
 
@@ -341,44 +345,28 @@ class ImageService:
     async def _gen_road(self, gid: int, geom_input: str, features: list) -> Union[BytesIO, Dict]:
         if not features:
             return {"message": "No road frontage detected within 1.5 km.", "status": "no_data"}
-    
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.4)
-        m = self._create_base_map(bounds)
+
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.1)  # ← parcel-relative buffer
+        m = self._create_base_map(bounds, padding=60)  # ← padding keeps parcel from hitting edges
         ROAD_STROKE = '#9E9E9E'
-        ROAD_CASING = '#424242'
+        ROAD_CASING = '#FFFFFF'
         
         for feat in features:
             feat_geom = self._feature_geometry(feat)
-            folium.GeoJson(
-                feat_geom,
-                style_function=lambda x: {
-                    'color': ROAD_CASING,
-                    'weight': 6.5,
-                    'opacity': 0.9,
-                    'lineCap': 'round',
-                    'lineJoin': 'round'
-                }
-            ).add_to(m)
-            
-            # Primary road stroke
-            folium.GeoJson(
-                feat_geom,
-                style_function=lambda x: {
-                    'color': ROAD_STROKE,
-                    'weight': 3.5,
-                    'opacity': 0.95,
-                    'lineCap': 'round',
-                    'lineJoin': 'round'
-                }
-            ).add_to(m)
+            folium.GeoJson(feat_geom, style_function=lambda x: {
+                'color': ROAD_CASING, 'weight': 6.5, 'opacity': 0.9,
+                'lineCap': 'round', 'lineJoin': 'round'
+            }).add_to(m)
+            folium.GeoJson(feat_geom, style_function=lambda x: {
+                'color': ROAD_STROKE, 'weight': 3.5, 'opacity': 0.95,
+                'lineCap': 'round', 'lineJoin': 'round'
+            }).add_to(m)
         
         self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
-        
         self._add_legend(m, [
             f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary",
             f"<span style='color:{ROAD_STROKE}; background-color:{ROAD_CASING}; padding: 0 3px; font-weight: bold;'>▬</span> Road Frontage"
         ])
-        
         return await self._render_and_screenshot(m)
 
     async def get_flood_image(self, gid: int, geom_input: str, features: list, regenerate: bool = False):
@@ -495,7 +483,7 @@ class ImageService:
             c_geom = self._feature_geometry(feat)
             props = self._feature_properties(feat)
             elevation = props.get("elevation")
-            folium.GeoJson(c_geom, style_function=lambda x: {'color': '#FFFF00', 'weight': 2, 'opacity': 0.8}).add_to(m)
+            folium.GeoJson(c_geom, style_function=lambda x: {'color': '#FFFF00', 'weight': 3, 'opacity': 0.8}).add_to(m)
             
             if elevation is not None:
                 mid_point = c_geom.interpolate(0.5, normalized=True)
