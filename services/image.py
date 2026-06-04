@@ -3,6 +3,7 @@ import os
 import json
 import asyncio
 import base64
+from pyexpat import features
 import shutil
 import tempfile
 import math
@@ -342,17 +343,24 @@ class ImageService:
     async def get_road_frontage_image(self, gid: int, geom_input: str, features: list, regenerate: bool = False):
         return await self._handle_cache_or_generate(gid, "road_frontage", self._gen_road, geom_input, regenerate, features=features)
 
+    
     async def _gen_road(self, gid: int, geom_input: str, features: list) -> Union[BytesIO, Dict]:
         if not features:
             return {"message": "No road frontage detected within 1.5 km.", "status": "no_data"}
 
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.1)  # ← parcel-relative buffer
-        m = self._create_base_map(bounds, padding=60)  # ← padding keeps parcel from hitting edges
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.15)
+        m = self._create_base_map(bounds, padding=60)
         ROAD_STROKE = '#9E9E9E'
         ROAD_CASING = '#FFFFFF'
-        
+        FRONTAGE_COLOR = '#C6FF00'
+        FRONTAGE_CASING = '#1A1A00'  # dark olive casing instead of white — stops it bleeding into yellow parcel
+
+        parcel_buffer = shapely_geom.buffer(0.0002)
+
         for feat in features:
             feat_geom = self._feature_geometry(feat)
+
+            # Always render the full road in gray first
             folium.GeoJson(feat_geom, style_function=lambda x: {
                 'color': ROAD_CASING, 'weight': 6.5, 'opacity': 0.9,
                 'lineCap': 'round', 'lineJoin': 'round'
@@ -361,14 +369,35 @@ class ImageService:
                 'color': ROAD_STROKE, 'weight': 3.5, 'opacity': 0.95,
                 'lineCap': 'round', 'lineJoin': 'round'
             }).add_to(m)
-        
+
+        # Second pass: clip each road to parcel buffer → only the fronting segment gets cyan
+        for feat in features:
+            feat_geom = self._feature_geometry(feat)
+            if not feat_geom.intersects(parcel_buffer):
+                continue
+
+            # Clip road to the zone touching the parcel — this is the frontage-only segment
+            frontage_segment = feat_geom.intersection(parcel_buffer)
+            if frontage_segment.is_empty:
+                continue
+
+            folium.GeoJson(frontage_segment, style_function=lambda x: {
+                'color': FRONTAGE_CASING, 'weight': 8, 'opacity': 0.85,
+                'lineCap': 'round', 'lineJoin': 'round'
+            }).add_to(m)
+            folium.GeoJson(frontage_segment, style_function=lambda x: {
+                'color': FRONTAGE_COLOR, 'weight': 4.5, 'opacity': 1.0,
+                'lineCap': 'round', 'lineJoin': 'round'
+            }).add_to(m)
+
         self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
         self._add_legend(m, [
             f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary",
-            f"<span style='color:{ROAD_STROKE}; background-color:{ROAD_CASING}; padding: 0 3px; font-weight: bold;'>▬</span> Road Frontage"
+            f"<span style='color:{FRONTAGE_COLOR}; font-weight:bold;'>▬</span> Road Frontage (Adjacent)",
+            f"<span style='color:{ROAD_STROKE}; background-color:{ROAD_CASING}; padding: 0 3px;'>▬</span> Nearby Roads",
         ])
         return await self._render_and_screenshot(m)
-
+    
     async def get_flood_image(self, gid: int, geom_input: str, features: list, regenerate: bool = False):
         return await self._handle_cache_or_generate(gid, "flood_hazard", self._gen_flood, geom_input, regenerate, features=features)
 
@@ -380,7 +409,7 @@ class ImageService:
         if not hazardous:
             return {"message": "No flood hazards detected on property.", "status": "no_data"}
 
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.04)
         m = self._create_base_map(bounds)
 
         sld_mapping = {
@@ -424,7 +453,7 @@ class ImageService:
         return await self._handle_cache_or_generate(gid, "tree_coverage", self._gen_tree, geom_input, regenerate)
 
     async def _gen_tree(self, gid: int, geom_input: str) -> Union[BytesIO, Dict]:
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.03)
         has_trees = False
         m = self._create_base_map(bounds)
         
@@ -477,7 +506,7 @@ class ImageService:
         if not features:
             return {"message": "No contour lines detected.", "status": "no_data"}
 
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.03)
         m = self._create_base_map(bounds)
         for feat in features:
             c_geom = self._feature_geometry(feat)
@@ -506,7 +535,7 @@ class ImageService:
         if not features:
             return {"message": "No major water features detected.", "status": "no_data"}
             
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.024)
         m = self._create_base_map(bounds)
         # Force all water-related features to render in a consistent blue palette
         WATER_FILL = '#1E88E5'
@@ -546,7 +575,7 @@ class ImageService:
         if not features:
             return {"message": "No gas pipelines detected.", "status": "no_data"}
 
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.034)
         m = self._create_base_map(bounds)
         
         for feat in features:
@@ -572,7 +601,7 @@ class ImageService:
         if not features:
             return {"message": "No utility lines detected.", "status": "no_data"}
 
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.03)
         m = self._create_base_map(bounds)
         
         has_gas = False
@@ -625,29 +654,31 @@ class ImageService:
         if not features:
             return {"message": "No water wells detected on property.", "status": "no_data"}
         
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.03)
         m = self._create_base_map(bounds)
 
-        # Use a simple point marker (CircleMarker) instead of a large SVG pin
-        marker_color = "#cb2b27"
+        pin_svg = """<svg viewBox="0 0 384 512" width="28" height="40" style="filter: drop-shadow(2px 2px 3px rgba(0,0,0,0.6));" xmlns="http://www.w3.org/2000/svg">
+            <path fill="#cb2b27" stroke="white" stroke-width="15" d="M172.268 501.67C26.97 291.031 0 269.413 0 192 0 85.961 85.961 0 192 0s192 85.961 192 192c0 77.413-26.97 99.031-172.268 309.67-9.535 13.774-29.93 13.773-39.464 0zM192 272c44.183 0 80-35.817 80-80s-35.817-80-80-80-80 35.817-80 80 35.817 80 80 80z"/>
+        </svg>"""
+
         for feat in features:
             point_geom = self._feature_geometry(feat)
-            folium.CircleMarker(
+            folium.Marker(
                 location=[point_geom.y, point_geom.x],
-                radius=6,
-                color=marker_color,
-                fill=True,
-                fill_color=marker_color,
-                fill_opacity=0.95,
-                weight=1,
+                icon=folium.DivIcon(
+                    icon_size=(28, 40),
+                    icon_anchor=(14, 40),   # tip of the pin touches the exact coordinate
+                    html=pin_svg,
+                ),
                 tooltip="Water Well",
             ).add_to(m)
 
         self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
-        # Legend: show a small colored circle for wells
         self._add_legend(m, [
             f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary",
-            f"<svg width='12' height='12' xmlns='http://www.w3.org/2000/svg'><circle cx='6' cy='6' r='5' fill='{marker_color}' stroke='white' stroke-width='1'/></svg> Water Well"
+            "<svg width='14' height='20' viewBox='0 0 384 512' xmlns='http://www.w3.org/2000/svg'>"
+            "<path fill='#cb2b27' stroke='white' stroke-width='15' d='M172.268 501.67C26.97 291.031 0 269.413 0 192 0 85.961 85.961 0 192 0s192 85.961 192 192c0 77.413-26.97 99.031-172.268 309.67-9.535 13.774-29.93 13.773-39.464 0zM192 272c44.183 0 80-35.817 80-80s-35.817-80-80-80-80 35.817-80 80 35.817 80 80 80z'/>"
+            "</svg> Water Well",
         ])
         return await self._render_and_screenshot(m)
 
@@ -658,7 +689,7 @@ class ImageService:
         if not features:
             return {"message": "No electric transmission lines detected.", "status": "no_data"}
 
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.03)
         m = self._create_base_map(bounds)
 
         sld_styles = {
@@ -714,7 +745,7 @@ class ImageService:
         if not features:
             return {"message": "No transmission lines detected.", "status": "no_data"}
 
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.03)
         m = self._create_base_map(bounds)
 
         for feat in features:
@@ -743,7 +774,7 @@ class ImageService:
         if not features:
             return {"message": "No ponds or creeks detected.", "status": "no_data"}
 
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input)
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.03)
         m = self._create_base_map(bounds)
 
         has_streams = False
