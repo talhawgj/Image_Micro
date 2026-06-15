@@ -331,26 +331,20 @@ class ImageService:
         self._add_legend(m, [f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary"])
         return await self._render_and_screenshot(m)
 
-    async def get_road_frontage_image(self, gid: int, geom_input: str, features: list, regenerate: bool = False):
+    async def get_road_frontage_image(self, gid: int, geom_input: str, features: Dict[str, Any], regenerate: bool = False):
         return await self._handle_cache_or_generate(
             gid, 
             "road_frontage", 
             self._gen_road, 
             geom_input, 
             regenerate, 
-            features=features
+            payload_data=features
         )
 
-    async def _gen_road(self, gid: int, geom_input: str, features: list) -> Union[BytesIO, Dict]:
-        if isinstance(features, dict):
-            ext_feats = features.get("_extended_features", [])
-            ren_feats = features.get("_render_features", [])
-            int_feats = features.get("interior_roads", {}).get("features", [])
-        else:
-            # Graceful fallback if the old flat list is passed
-            ext_feats = features if isinstance(features, list) else []
-            ren_feats = []
-            int_feats = []
+    async def _gen_road(self, gid: int, geom_input: str, payload_data: Dict[str, Any]) -> Union[BytesIO, Dict]:
+        ext_feats = payload_data.get("_extended_features", [])
+        ren_feats = payload_data.get("_render_features", [])
+        int_feats = payload_data.get("interior_roads", {}).get("features", [])
 
         if not (ext_feats or ren_feats or int_feats):
             return {"message": "No road frontage detected within bounds.", "status": "no_data"}
@@ -358,7 +352,7 @@ class ImageService:
         shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.15)
         m = self._create_base_map(bounds, padding=60)
 
-        # 1. Target Parcel Styling (Custom Blue Override)
+        # 1. Target Parcel - Drawn FIRST so it sits underneath the road lines
         folium.GeoJson(
             mapping(shapely_geom),
             name="Target Parcel",
@@ -369,42 +363,53 @@ class ImageService:
                 "fillOpacity": 0.15,
             },
         ).add_to(m)
+
+        # 2. Contributing Roads (Magenta) - Drawn SECOND
         for feat in ext_feats:
             try:
                 folium.GeoJson(
-                    self._feature_geometry(feat),
+                    mapping(self._feature_geometry(feat)),
                     name="Contributing Road",
-                    style_function=lambda x: {"color": "#cc00cc", "weight": 4, "opacity": 0.75},
+                    style_function=lambda x: {"color": "#cc00cc", "weight": 5, "opacity": 0.8},
                 ).add_to(m)
             except Exception as e:
                 logger.warning(f"Skipping malformed contributing road: {e}")
 
-        # 3. Frontage Highlight (Orange, thick)
-        for feat in ren_feats:
-            try:
-                folium.GeoJson(
-                    self._feature_geometry(feat),
-                    name="Frontage Highlight",
-                    style_function=lambda x: {"color": "#ffaa00", "weight": 8, "opacity": 0.95},
-                ).add_to(m)
-            except Exception as e:
-                logger.warning(f"Skipping malformed frontage highlight: {e}")
-
-        # 4. Interior Roads (Orange, dashed)
+        # 3. Interior Roads (Orange, dashed) - Drawn THIRD
         for feat in int_feats:
             try:
+                feat_mapping = mapping(self._feature_geometry(feat))
+                
+                # White casing/shadow so the orange dashes are visible over dirt roads
                 folium.GeoJson(
-                    self._feature_geometry(feat),
+                    feat_mapping,
+                    style_function=lambda x: {"color": "#FFFFFF", "weight": 6, "opacity": 0.4}
+                ).add_to(m)
+                
+                folium.GeoJson(
+                    feat_mapping,
                     name="Interior Road",
                     style_function=lambda x: {
                         "color": "#ff6600",
                         "weight": 4,
-                        "opacity": 0.9,
+                        "opacity": 1.0,
                         "dashArray": "6, 6",
                     },
                 ).add_to(m)
             except Exception as e:
                 logger.warning(f"Skipping malformed interior road: {e}")
+
+        # 4. Frontage Highlight (Amber, thick) - Drawn LAST to sit firmly on top
+        for feat in ren_feats:
+            try:
+                folium.GeoJson(
+                    mapping(self._feature_geometry(feat)),
+                    name="Frontage Highlight",
+                    style_function=lambda x: {"color": "#ffaa00", "weight": 9, "opacity": 1.0},
+                ).add_to(m)
+            except Exception as e:
+                logger.warning(f"Skipping malformed frontage highlight: {e}")
+
         self._add_legend(m, [
             "<span style='color:#0044ff; background-color:rgba(51, 136, 255, 0.15); border: 1px solid #0044ff; padding: 0 3px;'>▬</span> Target Parcel",
             "<span style='color:#ffaa00; font-weight:bold;'>▬</span> Frontage Highlight",
