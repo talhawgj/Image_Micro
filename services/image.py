@@ -3,26 +3,26 @@ import os
 import json
 import asyncio
 import base64
-from pyexpat import features
 import shutil
 import tempfile
 import math
 from collections.abc import Callable
 from io import BytesIO
 from typing import Dict, Optional, Union, Tuple, List, Any
-
+import rasterio.features
 import boto3
 from botocore.exceptions import ClientError
 import numpy as np
 import rasterio
 from rasterio.mask import mask
-from PIL import Image
+from PIL import Image,ImageFilter
 import folium
 import geopandas as gpd
 from shapely.geometry import shape, mapping, Polygon
 from shapely import wkt
 from config import config
 from utils import get_chrome_driver
+from scipy.ndimage import zoom
 import logging
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,6 @@ class ImageService:
         self.s3_base_url = f"https://{self.s3_bucket}.s3.{self.s3_region}.amazonaws.com"
         self.dem_path = config.ELEVATION_FILE
         self.tree_path = config.TREE_COVERAGE_PATH
-
         self._s3_client = boto3.client("s3", region_name=self.s3_region)
         self.STYLE_COLOR = "#FFEB3B"  
         self.STYLE_CASING = "#FFFFFF"  
@@ -236,22 +235,14 @@ class ImageService:
 
         m.get_root().html.add_child(folium.Element(north_arrow_html + """
             <style>
+                /* Hide the first child which is the metric (m/km) scale */
+                .leaflet-control-scale-line:first-child { display: none !important; border-bottom: none !important; }
+                
+                /* Ensure the imperial (ft/mi) scale looks correct */
+                .leaflet-control-scale-line:last-child { border-top: 2px solid white !important; }
+
                 .leaflet-tile-pane { opacity: 0.8 !important; }
-                .leaflet-container { background: #000 !important; }
-                .leaflet-map-pane::before {
-                    content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-                    pointer-events: none; box-shadow: inset 0 0 80px rgba(0,0,0,0.25);
-                }
-                .leaflet-control-scale {
-                    margin-bottom: 35px !important; margin-left: 65px !important;
-                }
-                .leaflet-control-scale-line {
-                    background: transparent !important; border: 2px solid white !important;
-                    border-top: none !important; color: white !important; font-weight: 700 !important;
-                    font-size: 14px !important; font-family: Arial, sans-serif !important;
-                    text-shadow: 1px 1px 3px black, -1px -1px 3px black, 1px -1px 3px black, -1px 1px 3px black !important;
-                    box-shadow: none !important; padding-bottom: 4px !important; line-height: 1.2 !important;
-                }
+                /* ... [keep your existing CSS here] ... */
             </style>
         """))
         return m
@@ -341,61 +332,86 @@ class ImageService:
         return await self._render_and_screenshot(m)
 
     async def get_road_frontage_image(self, gid: int, geom_input: str, features: list, regenerate: bool = False):
-        return await self._handle_cache_or_generate(gid, "road_frontage", self._gen_road, geom_input, regenerate, features=features)
+        return await self._handle_cache_or_generate(
+            gid, 
+            "road_frontage", 
+            self._gen_road, 
+            geom_input, 
+            regenerate, 
+            features=features
+        )
 
-    
     async def _gen_road(self, gid: int, geom_input: str, features: list) -> Union[BytesIO, Dict]:
-        if not features:
-            return {"message": "No road frontage detected within 1.5 km.", "status": "no_data"}
+        if isinstance(features, dict):
+            ext_feats = features.get("_extended_features", [])
+            ren_feats = features.get("_render_features", [])
+            int_feats = features.get("interior_roads", {}).get("features", [])
+        else:
+            # Graceful fallback if the old flat list is passed
+            ext_feats = features if isinstance(features, list) else []
+            ren_feats = []
+            int_feats = []
+
+        if not (ext_feats or ren_feats or int_feats):
+            return {"message": "No road frontage detected within bounds.", "status": "no_data"}
 
         shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.15)
         m = self._create_base_map(bounds, padding=60)
-        ROAD_STROKE = '#9E9E9E'
-        ROAD_CASING = '#FFFFFF'
-        FRONTAGE_COLOR = '#C6FF00'
-        FRONTAGE_CASING = '#1A1A00'  # dark olive casing instead of white — stops it bleeding into yellow parcel
 
-        parcel_buffer = shapely_geom.buffer(0.0002)
+        # 1. Target Parcel Styling (Custom Blue Override)
+        folium.GeoJson(
+            mapping(shapely_geom),
+            name="Target Parcel",
+            style_function=lambda x: {
+                "fillColor": "#3388ff",
+                "color": "#0044ff",
+                "weight": 3,
+                "fillOpacity": 0.15,
+            },
+        ).add_to(m)
+        for feat in ext_feats:
+            try:
+                folium.GeoJson(
+                    self._feature_geometry(feat),
+                    name="Contributing Road",
+                    style_function=lambda x: {"color": "#cc00cc", "weight": 4, "opacity": 0.75},
+                ).add_to(m)
+            except Exception as e:
+                logger.warning(f"Skipping malformed contributing road: {e}")
 
-        for feat in features:
-            feat_geom = self._feature_geometry(feat)
+        # 3. Frontage Highlight (Orange, thick)
+        for feat in ren_feats:
+            try:
+                folium.GeoJson(
+                    self._feature_geometry(feat),
+                    name="Frontage Highlight",
+                    style_function=lambda x: {"color": "#ffaa00", "weight": 8, "opacity": 0.95},
+                ).add_to(m)
+            except Exception as e:
+                logger.warning(f"Skipping malformed frontage highlight: {e}")
 
-            # Always render the full road in gray first
-            folium.GeoJson(feat_geom, style_function=lambda x: {
-                'color': ROAD_CASING, 'weight': 6.5, 'opacity': 0.9,
-                'lineCap': 'round', 'lineJoin': 'round'
-            }).add_to(m)
-            folium.GeoJson(feat_geom, style_function=lambda x: {
-                'color': ROAD_STROKE, 'weight': 3.5, 'opacity': 0.95,
-                'lineCap': 'round', 'lineJoin': 'round'
-            }).add_to(m)
-
-        # Second pass: clip each road to parcel buffer → only the fronting segment gets cyan
-        for feat in features:
-            feat_geom = self._feature_geometry(feat)
-            if not feat_geom.intersects(parcel_buffer):
-                continue
-
-            # Clip road to the zone touching the parcel — this is the frontage-only segment
-            frontage_segment = feat_geom.intersection(parcel_buffer)
-            if frontage_segment.is_empty:
-                continue
-
-            folium.GeoJson(frontage_segment, style_function=lambda x: {
-                'color': FRONTAGE_CASING, 'weight': 8, 'opacity': 0.85,
-                'lineCap': 'round', 'lineJoin': 'round'
-            }).add_to(m)
-            folium.GeoJson(frontage_segment, style_function=lambda x: {
-                'color': FRONTAGE_COLOR, 'weight': 4.5, 'opacity': 1.0,
-                'lineCap': 'round', 'lineJoin': 'round'
-            }).add_to(m)
-
-        self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
+        # 4. Interior Roads (Orange, dashed)
+        for feat in int_feats:
+            try:
+                folium.GeoJson(
+                    self._feature_geometry(feat),
+                    name="Interior Road",
+                    style_function=lambda x: {
+                        "color": "#ff6600",
+                        "weight": 4,
+                        "opacity": 0.9,
+                        "dashArray": "6, 6",
+                    },
+                ).add_to(m)
+            except Exception as e:
+                logger.warning(f"Skipping malformed interior road: {e}")
         self._add_legend(m, [
-            f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary",
-            f"<span style='color:{FRONTAGE_COLOR}; font-weight:bold;'>▬</span> Road Frontage (Adjacent)",
-            f"<span style='color:{ROAD_STROKE}; background-color:{ROAD_CASING}; padding: 0 3px;'>▬</span> Nearby Roads",
+            "<span style='color:#0044ff; background-color:rgba(51, 136, 255, 0.15); border: 1px solid #0044ff; padding: 0 3px;'>▬</span> Target Parcel",
+            "<span style='color:#ffaa00; font-weight:bold;'>▬</span> Frontage Highlight",
+            "<span style='color:#cc00cc;'>▬</span> Contributing Roads",
+            "<span style='color:#ff6600; border-bottom: 2px dashed #ff6600; height: 0; display: inline-block; width: 15px; margin-bottom: 3px;'></span> Interior Roads",
         ])
+
         return await self._render_and_screenshot(m)
     
     async def get_flood_image(self, gid: int, geom_input: str, features: list, regenerate: bool = False):
@@ -468,23 +484,44 @@ class ImageService:
                         with rasterio.open(fpath) as src:
                             if not (src.bounds.right < bbox[0] or src.bounds.left > bbox[2] or src.bounds.bottom > bbox[3] or src.bounds.top < bbox[1]):
                                 try:
-                                    out_image, _ = mask(src, [mapping(proj_geom)], crop=True, nodata=0)
+                                    # Note: We now capture 'out_transform' to correctly map the pixels to real-world coordinates
+                                    out_image, out_transform = mask(src, [mapping(proj_geom)], crop=True, nodata=0)
                                     data = out_image[0]
+                                    
                                     if np.any(data > 0.1):
                                         has_trees = True
-                                        rgba = np.zeros((data.shape[0], data.shape[1], 4), dtype=np.uint8)
-                                        rgba[(data > 0.1) & (data <= 3.0)] = [124, 179, 66, 217]
-                                        rgba[(data > 3.0)] = [27, 94, 32, 242]
                                         
-                                        img_buf = BytesIO()
-                                        Image.fromarray(rgba).save(img_buf, format='PNG')
-                                        img_b64 = base64.b64encode(img_buf.getvalue()).decode('utf-8')
+                                        # 1. Create a binary mask of where trees exist
+                                        tree_mask = (data > 0.1).astype('uint8')
                                         
-                                        folium.raster_layers.ImageOverlay(
-                                            f"data:image/png;base64,{img_b64}", 
-                                            bounds=[[bounds[1], bounds[0]], [bounds[3], bounds[2]]], opacity=1.0
-                                        ).add_to(m)
-                                        break
+                                        # 2. Extract Vector Polygons from the Raster pixels
+                                        shapes = rasterio.features.shapes(tree_mask, transform=out_transform)
+                                        polygons = [shape(geom) for geom, val in shapes if val == 1]
+                                        
+                                        if polygons:
+                                            # 3. Load into GeoPandas (using your projected CRS from earlier)
+                                            tree_gdf = gpd.GeoDataFrame(geometry=polygons, crs="EPSG:3857")
+                                            
+                                            # 4. The Vector Smoothing Magic: 
+                                            # Buffer outwards (5 meters) to round outer pixel corners, 
+                                            # then buffer inwards (-5 meters) to return to original size while rounding inner corners.
+                                            tree_gdf['geometry'] = tree_gdf.geometry.buffer(5).buffer(-5)
+                                            
+                                            # 5. Convert to lat/long for Folium
+                                            tree_gdf = tree_gdf.to_crs(epsg=4326)
+                                            
+                                            # 6. Add to map as a Vector GeoJson Layer (resolution independent)
+                                            folium.GeoJson(
+                                                tree_gdf,
+                                                style_function=lambda feature: {
+                                                    'fillColor': '#1B5E20',  # Dark green fill
+                                                    'color': '#7CB342',      # Lighter green border
+                                                    'weight': 1.5,           # Border thickness
+                                                    'fillOpacity': 0.85,
+                                                    'smoothFactor': 1.0      # Tells Leaflet to smooth the vector lines
+                                                }
+                                            ).add_to(m)
+                                            break
                                 except Exception: continue
             except Exception: pass
 
@@ -492,11 +529,13 @@ class ImageService:
             return {"message": "No significant tree coverage detected.", "status": "no_data"}
 
         self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
+        
+        # 5. Legend Update
         self._add_legend(m, [
             f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary", 
-            "<span style='color:#1B5E20;'>■</span> Dense Tree Coverage",
-            "<span style='color:#7CB342;'>■</span> Shrubs & Brush"
+            "<span style='background: linear-gradient(to right, #7CB342, #1B5E20); -webkit-background-clip: text; color: transparent;'>■</span> Tree Coverage Density"
         ])
+        
         return await self._render_and_screenshot(m)
 
     async def get_contour_image(self, gid: int, geom_input: str, features: list, regenerate: bool = False):
@@ -537,35 +576,54 @@ class ImageService:
             
         shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.024)
         m = self._create_base_map(bounds)
-        # Force all water-related features to render in a consistent blue palette
+        
         WATER_FILL = '#1E88E5'
         WATER_STROKE = '#0D47A1'
         WATER_LINE = '#1976D2'
+        WETLAND_FILL = '#4DB6AC'
+        WETLAND_STROKE = '#00695C'
         WATER_OPACITY = 0.5
+
+        has_streams = False
+        has_polygons = False
+        has_wetlands = False
 
         for feat in features:
             feat_geom = self._feature_geometry(feat)
             props = self._feature_properties(feat)
-            f_type = (props.get("type") or "").lower()
+            f_type = (props.get("type") or props.get("strm_type") or "").lower()
+            w_type = (props.get("wetland_type") or "").lower()
 
-            # Render linear features (streams, rivers) as blue lines
-            if f_type in {"stream", "river", "creek"}:
+            # Render linear features (streams, creeks, rivers) and riverine
+            if f_type in {"stream", "river", "creek"} or w_type == "riverine":
+                has_streams = True
                 folium.GeoJson(feat_geom, style_function=lambda x: {'color': WATER_LINE, 'weight': 2.5, 'lineCap': 'round', 'lineJoin': 'round', 'opacity': 1.0}).add_to(m)
                 name = props.get("name")
                 if name:
-                    mid = feat_geom.interpolate(0.5, normalized=True)
+                    mid = feat_geom.interpolate(0.5, normalized=True) if feat_geom.geom_type in ['LineString', 'MultiLineString'] else feat_geom.centroid
                     folium.map.Marker([mid.y, mid.x], icon=folium.DivIcon(html=f"""<div style="font-family: Arial, sans-serif; font-size: 11pt; color: white; font-style: italic; font-weight: bold; white-space: nowrap; text-shadow: -2px -2px 0 {WATER_STROKE}, 2px -2px 0 {WATER_STROKE}, -2px 2px 0 {WATER_STROKE}, 2px 2px 0 {WATER_STROKE};">{name}</div>""")).add_to(m)
 
-            # Render polygonal water features (ponds, lakes, wetlands, open sea) as blue fills
+            # Render standard wetlands
+            elif f_type == "wetland":
+                has_wetlands = True
+                folium.GeoJson(feat_geom, style_function=lambda x: {'fillColor': WETLAND_FILL, 'color': WETLAND_STROKE, 'fillOpacity': 0.4, 'weight': 1.5}).add_to(m)
+
+            # Render polygonal water features (ponds, lakes, sea)
             else:
+                has_polygons = True
                 folium.GeoJson(feat_geom, style_function=lambda x: {'fillColor': WATER_FILL, 'color': WATER_STROKE, 'fillOpacity': WATER_OPACITY, 'weight': 1.5}).add_to(m)
 
         self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
-        self._add_legend(m, [
-            f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary", 
-            f"<span style='color:{WATER_LINE};'>▬</span> Rivers/Streams",
-            f"<span style='color:{WATER_FILL};'>■</span> Ponds/Lakes/Wetlands/Open Water",
-        ])
+        
+        legend_items = [f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary"]
+        if has_streams:
+            legend_items.append(f"<span style='color:{WATER_LINE};'>▬</span> Rivers/Creeks")
+        if has_polygons:
+            legend_items.append(f"<span style='color:{WATER_FILL};'>■</span> Ponds/Lakes/Open Water")
+        if has_wetlands:
+            legend_items.append(f"<span style='color:{WETLAND_FILL};'>■</span> Wetlands")
+
+        self._add_legend(m, legend_items)
         return await self._render_and_screenshot(m)
 
     async def get_pipeline_image(self, gid: int, geom_input: str, features: list, regenerate: bool = False):
