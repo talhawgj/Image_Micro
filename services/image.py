@@ -351,20 +351,7 @@ class ImageService:
 
         shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.15)
         m = self._create_base_map(bounds, padding=60)
-
-        # 1. Target Parcel - Drawn FIRST so it sits underneath the road lines
-        folium.GeoJson(
-            mapping(shapely_geom),
-            name="Target Parcel",
-            style_function=lambda x: {
-                "fillColor": "#3388ff",
-                "color": "#0044ff",
-                "weight": 3,
-                "fillOpacity": 0.15,
-            },
-        ).add_to(m)
-
-        # 2. Contributing Roads (Magenta) - Drawn SECOND
+        self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
         for feat in ext_feats:
             try:
                 folium.GeoJson(
@@ -374,13 +361,9 @@ class ImageService:
                 ).add_to(m)
             except Exception as e:
                 logger.warning(f"Skipping malformed contributing road: {e}")
-
-        # 3. Interior Roads (Orange, dashed) - Drawn THIRD
         for feat in int_feats:
             try:
                 feat_mapping = mapping(self._feature_geometry(feat))
-                
-                # White casing/shadow so the orange dashes are visible over dirt roads
                 folium.GeoJson(
                     feat_mapping,
                     style_function=lambda x: {"color": "#FFFFFF", "weight": 6, "opacity": 0.4}
@@ -398,21 +381,19 @@ class ImageService:
                 ).add_to(m)
             except Exception as e:
                 logger.warning(f"Skipping malformed interior road: {e}")
-
-        # 4. Frontage Highlight (Amber, thick) - Drawn LAST to sit firmly on top
         for feat in ren_feats:
             try:
                 folium.GeoJson(
                     mapping(self._feature_geometry(feat)),
                     name="Frontage Highlight",
-                    style_function=lambda x: {"color": "#ffaa00", "weight": 9, "opacity": 1.0},
+                    style_function=lambda x: {"color": "#000dff", "weight": 9, "opacity": 1.0},
                 ).add_to(m)
             except Exception as e:
                 logger.warning(f"Skipping malformed frontage highlight: {e}")
 
         self._add_legend(m, [
-            "<span style='color:#0044ff; background-color:rgba(51, 136, 255, 0.15); border: 1px solid #0044ff; padding: 0 3px;'>▬</span> Target Parcel",
-            "<span style='color:#ffaa00; font-weight:bold;'>▬</span> Frontage Highlight",
+            f"<span style='color:{self.STYLE_COLOR};'>▬</span> Target Parcel",
+            "<span style='color:#000dff; font-weight:bold;'>▬</span> Frontage Highlight",
             "<span style='color:#cc00cc;'>▬</span> Contributing Roads",
             "<span style='color:#ff6600; border-bottom: 2px dashed #ff6600; height: 0; display: inline-block; width: 15px; margin-bottom: 3px;'></span> Interior Roads",
         ])
@@ -577,56 +558,105 @@ class ImageService:
 
     async def _gen_water(self, gid: int, geom_input: str, features: list) -> Union[BytesIO, Dict]:
         if not features:
-            return {"message": "No major water features detected.", "status": "no_data"}
+            return {"message": "No water features detected.", "status": "no_data"}
             
-        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.024)
+        shapely_geom, bounds = self._get_geometry_and_bounds(geom_input, buffer_km=0.04) # slightly zoomed out
         m = self._create_base_map(bounds)
         
-        WATER_FILL = '#1E88E5'
-        WATER_STROKE = '#0D47A1'
-        WATER_LINE = '#1976D2'
-        WETLAND_FILL = '#4DB6AC'
-        WETLAND_STROKE = '#00695C'
+        WATER_FILL = "#70B1EB"      # Standard Blue
+        WATER_STROKE = "#2A74E3"    # Deep Dark Blue
+        WATER_LINE = "#34DEEB"      # Vivid Light Blue (Changed from #5AA6F1)
+        
+        WETLAND_STYLES = {
+            "Estuarine and Marine Deepwater": {"fill": "#1E88E5", "stroke": "#0D47A1"},
+            "Estuarine and Marine Wetland": {"fill": "#4DB6AC", "stroke": "#00695C"},
+            "Freshwater Emergent Wetland": {"fill": "#80CBC4", "stroke": "#00897B"},
+            "Freshwater Forested/Shrub Wetland": {"fill": "#66BB6A", "stroke": "#2E7D32"},
+            "Freshwater Pond": {"fill": "#81D4FA", "stroke": "#0288D1"},
+            "Lake": {"fill": "#64B5F6", "stroke": "#1565C0"},
+            "Riverine": {"fill": "#4FC3F7", "stroke": "#0277BD"},
+            "Other": {"fill": "#B0BEC5", "stroke": "#546E7A"}
+        }
+        
         WATER_OPACITY = 0.5
-
         has_streams = False
         has_polygons = False
-        has_wetlands = False
+        present_wetland_types = set()
+
+        # Separate features to control draw order
+        stream_feats = []
+        poly_feats = []
 
         for feat in features:
-            feat_geom = self._feature_geometry(feat)
             props = self._feature_properties(feat)
-            f_type = (props.get("type") or props.get("strm_type") or "").lower()
-            w_type = (props.get("wetland_type") or "").lower()
+            f_type = (props.get("type") or props.get("strm_type") or props.get("FEATURE_TYPE") or "").lower()
+            w_type_raw = props.get("wetland_type")
+            w_type_lower = (w_type_raw or "").lower()
+            is_wetland = f_type == "wetland" or "wetland" in w_type_lower or w_type_raw in WETLAND_STYLES
 
-            # Render linear features (streams, creeks, rivers) and riverine
-            if f_type in {"stream", "river", "creek"} or w_type == "riverine":
-                has_streams = True
-                folium.GeoJson(feat_geom, style_function=lambda x: {'color': WATER_LINE, 'weight': 2.5, 'lineCap': 'round', 'lineJoin': 'round', 'opacity': 1.0}).add_to(m)
-                name = props.get("name")
-                if name:
-                    mid = feat_geom.interpolate(0.5, normalized=True) if feat_geom.geom_type in ['LineString', 'MultiLineString'] else feat_geom.centroid
-                    folium.map.Marker([mid.y, mid.x], icon=folium.DivIcon(html=f"""<div style="font-family: Arial, sans-serif; font-size: 11pt; color: white; font-style: italic; font-weight: bold; white-space: nowrap; text-shadow: -2px -2px 0 {WATER_STROKE}, 2px -2px 0 {WATER_STROKE}, -2px 2px 0 {WATER_STROKE}, 2px 2px 0 {WATER_STROKE};">{name}</div>""")).add_to(m)
+            if f_type in {"stream", "river", "creek", "major river"} and not is_wetland:
+                stream_feats.append((feat, props))
+            else:
+                poly_feats.append((feat, props, is_wetland, w_type_raw))
 
-            # Render standard wetlands
-            elif f_type == "wetland":
-                has_wetlands = True
-                folium.GeoJson(feat_geom, style_function=lambda x: {'fillColor': WETLAND_FILL, 'color': WETLAND_STROKE, 'fillOpacity': 0.4, 'weight': 1.5}).add_to(m)
-
-            # Render polygonal water features (ponds, lakes, sea)
+        # 1. Draw Polygons (Bottom Layer)
+        for feat, props, is_wetland, w_type_raw in poly_feats:
+            feat_geom = self._feature_geometry(feat)
+            if is_wetland:
+                display_type = w_type_raw if w_type_raw in WETLAND_STYLES else "Other"
+                matched_style = WETLAND_STYLES[display_type]
+                present_wetland_types.add(display_type)
+                
+                # Must capture 'fill' and 'stroke' in the lambda scope
+                folium.GeoJson(
+                    feat_geom, 
+                    style_function=lambda x, fill=matched_style["fill"], stroke=matched_style["stroke"]: {
+                        'fillColor': fill, 
+                        'color': stroke, 
+                        'fillOpacity': 0.35, 
+                        'weight': 1.5
+                    }
+                ).add_to(m)
             else:
                 has_polygons = True
-                folium.GeoJson(feat_geom, style_function=lambda x: {'fillColor': WATER_FILL, 'color': WATER_STROKE, 'fillOpacity': WATER_OPACITY, 'weight': 1.5}).add_to(m)
+                folium.GeoJson(
+                    feat_geom, 
+                    style_function=lambda x: {'fillColor': WATER_FILL, 'color': WATER_STROKE, 'fillOpacity': WATER_OPACITY, 'weight': 1.5}
+                ).add_to(m)
 
+        # 2. Draw Streams (Middle Layer - sits strictly on top of polygons)
+        for feat, props in stream_feats:
+            has_streams = True
+            feat_geom = self._feature_geometry(feat)
+            
+            folium.GeoJson(
+                feat_geom, 
+                style_function=lambda x: {'color': WATER_LINE, 'weight': 3.0, 'lineCap': 'round', 'lineJoin': 'round', 'opacity': 1.0}
+            ).add_to(m)
+            
+            name = props.get("name") or props.get("strm_nm")
+            if name:
+                mid = feat_geom.interpolate(0.5, normalized=True) if feat_geom.geom_type in ['LineString', 'MultiLineString'] else feat_geom.centroid
+                folium.map.Marker(
+                    [mid.y, mid.x], 
+                    icon=folium.DivIcon(html=f"""<div style="font-family: Arial, sans-serif; font-size: 11pt; color: white; font-style: italic; font-weight: bold; white-space: nowrap; text-shadow: -2px -2px 0 {WATER_STROKE}, 2px -2px 0 {WATER_STROKE}, -2px 2px 0 {WATER_STROKE}, 2px 2px 0 {WATER_STROKE};">{name}</div>""")
+                ).add_to(m)
         self._apply_parcel_style(m, shapely_geom, darken_exterior=False)
         
         legend_items = [f"<span style='color:{self.STYLE_COLOR};'>▬</span> Property Boundary"]
+        
         if has_streams:
-            legend_items.append(f"<span style='color:{WATER_LINE};'>▬</span> Rivers/Creeks")
+            legend_items.append(f"<span style='color:{WATER_LINE}; font-weight:bold;'>▬</span> Rivers/Creeks")
+        
         if has_polygons:
-            legend_items.append(f"<span style='color:{WATER_FILL};'>■</span> Ponds/Lakes/Open Water")
-        if has_wetlands:
-            legend_items.append(f"<span style='color:{WETLAND_FILL};'>■</span> Wetlands")
+            legend_items.append(f"<span style='display:inline-block; width:12px; height:12px; background:{WATER_FILL}; border:1px solid {WATER_STROKE};'></span> Ponds/Lakes/Open Water")
+            
+        if present_wetland_types:
+            for w_type in sorted(present_wetland_types):
+                style = WETLAND_STYLES[w_type]
+                legend_items.append(
+                    f"<span style='display:inline-block; width:12px; height:12px; background:{style['fill']}; border:1px solid {style['stroke']};'></span> {w_type}"
+                )
 
         self._add_legend(m, legend_items)
         return await self._render_and_screenshot(m)

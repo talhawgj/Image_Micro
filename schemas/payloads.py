@@ -1,6 +1,5 @@
-
 from pydantic import BaseModel, Field, model_validator
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 
 class OverlayFeature(BaseModel):
     """Represents an intersecting feature like a flood zone, road, or city."""
@@ -20,4 +19,4 @@ class ImageRequestPayload(BaseModel):
     parcel_gid: int
     parcel_geojson: str
     regenerate: bool = False
-    overlay_features: Optional[List[OverlayFeature]] = Field(default_factory=list)
+    overlay_features: Optional[Union[List[OverlayFeature], Dict[str, Any]]] = Field(default_factory=list)
